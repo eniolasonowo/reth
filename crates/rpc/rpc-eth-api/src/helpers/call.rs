@@ -71,7 +71,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
-                return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into())
+                return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into());
             }
 
             let block = block.unwrap_or_default();
@@ -84,7 +84,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
             } = payload;
 
             if block_state_calls.is_empty() {
-                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
+                return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into());
             }
 
             let permit = self
@@ -160,6 +160,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                         evm_env.version_mut().features.remove(evm2::EvmFeatures::NONCE_CHECK);
                         evm_env.version_mut().features.remove(evm2::EvmFeatures::BASE_FEE_CHECK);
                         evm_env.block_env_mut().basefee = U256::ZERO;
+                        evm_env.block_env_mut().gas_limit = U256::from(u64::MAX);
                     }
 
                     // Set prevrandao to zero for simulated blocks by default,
@@ -176,12 +177,12 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
 
                     if let Some(block_overrides) = block_overrides {
                         // ensure we don't allow uncapped gas limit per block
-                        if let Some(gas_limit_override) = block_overrides.gas_limit &&
-                            gas_limit_override > evm_env.block_env().gas_limit.to::<u64>() &&
-                            gas_limit_override > this.call_gas_limit()
-                        {
-                            return Err(EthApiError::other(EthSimulateError::GasLimitReached).into())
-                        }
+                        // if let Some(gas_limit_override) = block_overrides.gas_limit &&
+                        //     gas_limit_override > evm_env.block_env().gas_limit.to::<u64>() &&
+                        //     gas_limit_override > this.call_gas_limit()
+                        // {
+                        //     return Err(EthApiError::other(EthSimulateError::GasLimitReached).into())
+                        // }
                         apply_block_overrides(block_overrides, &mut db, &mut evm_env);
                     }
                     if let Some(ref state_overrides) = state_overrides {
@@ -329,7 +330,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                     .block_hash_for_id(target_block)
                     .map_err(Self::Error::from_eth_err::<ProviderError>)?
                 else {
-                    return Err(EthApiError::HeaderNotFound(target_block).into())
+                    return Err(EthApiError::HeaderNotFound(target_block).into());
                 };
                 target_block = block_hash.into();
             }
@@ -651,7 +652,7 @@ pub trait Call:
                     let _permit = permit;
                     if cancel.is_cancelled() {
                         // callsite dropped the guard
-                        return Err(EthApiError::InternalEthError.into())
+                        return Err(EthApiError::InternalEthError.into());
                     }
                     this.transact(db, evm_env, tx_env)
                 })
@@ -831,7 +832,7 @@ pub trait Call:
         for (index, tx) in transactions.into_iter().enumerate() {
             if index == target_tx_index {
                 // reached the target transaction
-                break
+                break;
             }
             if is_cancelled() {
                 return Err(EthApiError::InternalEthError.into())

@@ -143,6 +143,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         evm_env.cfg_env.disable_nonce_check = true;
                         evm_env.cfg_env.disable_base_fee = true;
                         evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+                        // Signals executors that the block gas limit is not enforced
+                        evm_env.cfg_env.disable_block_gas_limit = true;
                         evm_env.block_env.inner_mut().gas_limit = u64::MAX;
                         evm_env.block_env.inner_mut().basefee = 0;
                     }

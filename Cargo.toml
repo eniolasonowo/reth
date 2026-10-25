@@ -48,6 +48,7 @@ members = [
     "crates/evm/execution-errors",
     "crates/evm/execution-types",
     "crates/exex/exex/",
+    "crates/exex/pool-state/",
     "crates/exex/test-utils/",
     "crates/exex/types/",
     "crates/lru/",
@@ -144,6 +145,7 @@ members = [
     "examples/node-custom-rpc/",
     "examples/node-event-hooks/",
     "examples/polygon-p2p/",
+    "examples/pool-state-exex",
     "examples/rpc-db/",
     "examples/txpool-tracing/",
     "examples/custom-beacon-withdrawals",
@@ -397,6 +399,7 @@ reth-payload-builder = { path = "crates/payload/builder" }
 reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
 reth-payload-validator = { path = "crates/payload/validator" }
+reth-pool-state-exex = { path = "crates/exex/pool-state" }
 reth-primitives-traits = { version = "0.8.2", default-features = false }
 reth-provider = { path = "crates/storage/provider" }
 reth-prune = { path = "crates/prune/prune" }

@@ -1,0 +1,21 @@
+[package]
+name = "pool-state-exex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+# reth
+reth-ethereum = { workspace = true, features = ["full", "cli"] }
+reth-pool-state-exex.workspace = true
+
+alloy-primitives.workspace = true
+
+eyre.workspace = true
+clap = { workspace = true, features = ["derive"] }
+tokio.workspace = true
+tracing.workspace = true

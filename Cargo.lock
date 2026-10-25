@@ -6813,6 +6813,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pool-state-exex"
+version = "2.4.1"
+dependencies = [
+ "alloy-primitives",
+ "clap",
+ "eyre",
+ "reth-ethereum",
+ "reth-pool-state-exex",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9591,6 +9604,31 @@ dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
  "reth-primitives-traits",
+]
+
+[[package]]
+name = "reth-pool-state-exex"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-evm",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "eyre",
+ "futures",
+ "jsonrpsee",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-exex",
+ "reth-node-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "revm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

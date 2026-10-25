@@ -47,6 +47,7 @@ members = [
     "crates/evm/execution-errors",
     "crates/evm/execution-types",
     "crates/exex/exex/",
+    "crates/exex/pool-state/",
     "crates/exex/test-utils/",
     "crates/exex/types/",
     "crates/metrics/",
@@ -132,6 +133,7 @@ members = [
     "examples/db-access",
     "examples/exex-subscription",
     "examples/exex-test",
+    "examples/pool-state-exex",
     "examples/full-contract-state",
     "examples/manual-p2p/",
     "examples/network-txpool/",
@@ -361,6 +363,7 @@ reth-evm-ethereum = { path = "crates/ethereum/evm", default-features = false }
 reth-execution-errors = { path = "crates/evm/execution-errors", default-features = false }
 reth-execution-types = { path = "crates/evm/execution-types", default-features = false }
 reth-exex = { path = "crates/exex/exex" }
+reth-pool-state-exex = { path = "crates/exex/pool-state" }
 reth-exex-test-utils = { path = "crates/exex/test-utils" }
 reth-exex-types = { path = "crates/exex/types" }
 reth-fs-util = { path = "crates/fs-util" }

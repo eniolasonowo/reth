@@ -24,6 +24,7 @@ cargo docs --document-private-items
 - `crates/evm/`, `crates/ethereum/`: execution and Ethereum-specific components.
 - `crates/storage/`, `crates/trie/`, `crates/stages/`: persistence, state roots, and sync.
 - `crates/net/`, `crates/rpc/`: P2P networking and JSON-RPC.
+- `crates/exex/pool-state/`: pool-state ExEx; on every committed block, watches V3/V4 swap/liquidity and Morpho lending events, batches the affected pools into per-tip `eth_call`s (`getMultiTicksRange`, V3/V4 `getMultiRates`, Liquity `getRates`, lending `blockUpdate`) and publishes `PoolStateSnapshot`s on the `poolState` RPC namespace; runnable via the example node in `examples/pool-state-exex`.
 
 ## Testing
 

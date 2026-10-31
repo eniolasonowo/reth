@@ -19,6 +19,7 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 7. **Trie (`crates/trie/`)**: Merkle Patricia Trie implementation with a sparse trie state root task and parallel proof computation
 8. **Node Builder (`crates/node/`)**: High-level node orchestration and configuration
 9. **The Consensus Engine (`crates/engine/`)**: Handles processing blocks received from the consensus layer with the Engine API (newPayload, forkchoiceUpdated)
+10. **Execution Extensions (ExEx) (`crates/exex/pool-state/`)**: Pool-state ExEx — on every committed block, watches V3/V4 swap/liquidity and Morpho lending events, batches the affected pools into per-tip `eth_call`s (`getMultiTicksRange`, V3/V4 `getMultiRates`, Liquity `getRates`, lending `blockUpdate`) and publishes `PoolStateSnapshot`s on the `poolState` RPC namespace; runnable via the example node in `examples/pool-state-exex`
 
 ### Key Design Principles
 

@@ -51,6 +51,14 @@ pub struct PoolStateArgs {
     )]
     exex_pool_state_v3_rates_contract: Option<Address>,
 
+    /// Liquity contract exposing getRates (protocol-keyed rows).
+    #[arg(
+        long = "exex.pool-state.liquity-rates-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state"
+    )]
+    exex_pool_state_liquity_rates_contract: Option<Address>,
+
     /// Lending contract exposing blockUpdate (bytes32-keyed markets).
     #[arg(
         long = "exex.pool-state.lending-contract",
@@ -87,6 +95,7 @@ fn main() -> eyre::Result<()> {
                     contract_v4,
                     ext.exex_pool_state_v4_rates_contract,
                     ext.exex_pool_state_v3_rates_contract,
+                    ext.exex_pool_state_liquity_rates_contract,
                     ext.exex_pool_state_lending_contract,
                     ext.exex_pool_state_topics.clone(),
                 )

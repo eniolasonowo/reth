@@ -7,8 +7,8 @@
 //! 2. Selects one tick per pool: the last `Swap` tick outranks liquidity events; otherwise the last
 //!    `Mint`/`Burn`/`ModifyLiquidity` `tickLower`.
 //! 3. Batches all selected pools into a single `getMultiTicksRange` `eth_call` pinned to the new
-//!    chain tip, plus `getMultiRates` calls (V4 PoolKey- and V3 address-keyed) and a lending
-//!    `blockUpdate` call when configured.
+//!    chain tip, plus `getMultiRates` calls (V4 PoolKey- and V3 address-keyed), a Liquity
+//!    `getRates` call and a lending `blockUpdate` call when configured.
 //! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a [`watch`] channel served by
 //!    the `poolState` RPC namespace (see [`rpc`]).
 //!
@@ -17,7 +17,7 @@
 //! chains.
 
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
-use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
+use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160, U256};
 use alloy_sol_types::{SolCall, SolEvent};
 use futures::TryStreamExt;
 use reth_ethereum_primitives::EthPrimitives;
@@ -342,6 +342,24 @@ alloy_sol_types::sol! {
     }
 }
 
+// Liquity rates contract: no arguments; the contract returns its own
+// configured rows, one per protocol with six data columns.
+alloy_sol_types::sol! {
+    #[derive(Debug)]
+    interface ILiquityRates {
+        struct Out {
+            uint256 protocol;
+            uint256[] col0;
+            uint256[] col1;
+            uint256[] col2;
+            uint256[] col3;
+            uint256[] col4;
+            uint256[] col5;
+        }
+        function getRates() public returns (Out[] memory outs);
+    }
+}
+
 // Lending block-update contract: markets are identified by bytes32 id.
 alloy_sol_types::sol! {
     #[derive(Debug)]
@@ -439,6 +457,26 @@ pub struct PoolRatesEntry {
     pub rates1_out: Vec<String>,
 }
 
+/// One row of the Liquity `getRates` table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquityRatesEntry {
+    /// Protocol identifier, decimal string (uint256).
+    pub protocol: String,
+    /// Column 0 values, decimal strings (uint256).
+    pub col0: Vec<String>,
+    /// Column 1 values, decimal strings (uint256).
+    pub col1: Vec<String>,
+    /// Column 2 values, decimal strings (uint256).
+    pub col2: Vec<String>,
+    /// Column 3 values, decimal strings (uint256).
+    pub col3: Vec<String>,
+    /// Column 4 values, decimal strings (uint256).
+    pub col4: Vec<String>,
+    /// Column 5 values, decimal strings (uint256).
+    pub col5: Vec<String>,
+}
+
 /// One user position of a lending market.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -526,6 +564,9 @@ pub struct PoolStateSnapshot {
     /// One entry per pool with a configured rates contract; empty if no
     /// rates contract is configured or the call failed.
     pub rates: Vec<PoolRatesEntry>,
+    /// Liquity rates from `getRates`; empty if the Liquity contract is
+    /// not configured or the call failed.
+    pub liquity_rates: Vec<LiquityRatesEntry>,
     /// Lending data from `blockUpdate`; empty if the lending contract is
     /// not configured or the call failed.
     pub lending: LendingBlockUpdateData,
@@ -681,6 +722,8 @@ pub struct PoolStateConfig {
     pub contract_v4_rates: Option<Address>,
     /// V3-family contract exposing `getMultiRates` (address-keyed pools).
     pub contract_v3_rates: Option<Address>,
+    /// Liquity contract exposing `getRates` (protocol-keyed rows).
+    pub contract_liquity_rates: Option<Address>,
     /// Lending contract exposing `blockUpdate` (bytes32-keyed markets).
     pub contract_lending: Option<Address>,
     /// Topic0 filter; defaults to [`default_topics`].
@@ -695,6 +738,7 @@ impl PoolStateConfig {
         contract_v4: Option<Address>,
         contract_v4_rates: Option<Address>,
         contract_v3_rates: Option<Address>,
+        contract_liquity_rates: Option<Address>,
         contract_lending: Option<Address>,
         topics: Option<Vec<B256>>,
     ) -> Self {
@@ -703,6 +747,7 @@ impl PoolStateConfig {
             contract_v4,
             contract_v4_rates,
             contract_v3_rates,
+            contract_liquity_rates,
             contract_lending,
             topics: topics.unwrap_or_else(default_topics),
         }
@@ -768,6 +813,7 @@ where
         target: TARGET,
         contract_v3 = ?cfg.contract_v3,
         contract_v4 = ?cfg.contract_v4,
+        contract_liquity_rates = ?cfg.contract_liquity_rates,
         contract_lending = ?cfg.contract_lending,
         topics = cfg.topics.len(),
         "pool-state ExEx started"
@@ -864,11 +910,21 @@ fn process_chain<N>(
         LendingBlockUpdateData::default()
     };
 
+    // Liquity rates call: independent of the pool ticks/rates calls. Runs
+    // on every committed block — the contract returns its full configured
+    // table regardless of the block's events.
+    let liquity_rates = if cfg.contract_liquity_rates.is_some() {
+        process_liquity_rates(chain, cfg, evm_config, provider)
+    } else {
+        Vec::new()
+    };
+
     if selections_v3.is_empty() && selections_v4.is_empty() {
-        if lending_data.is_empty() {
+        if lending_data.is_empty() && liquity_rates.is_empty() {
             return;
         }
-        // Lending-only block: publish the snapshot with empty pool entries.
+        // Lending/liquity-only block: publish the snapshot with empty pool
+        // entries.
         let tip = chain.tip();
         let snapshot = PoolStateSnapshot {
             block_number: tip.number(),
@@ -880,13 +936,15 @@ fn process_chain<N>(
             base_fee: tip.header().base_fee_per_gas().unwrap_or_default(),
             entries: Vec::new(),
             rates: Vec::new(),
+            liquity_rates,
             lending: lending_data,
         };
         tracing::debug!(
             target: TARGET,
             block_number = snapshot.block_number,
             markets = snapshot.lending.market_details.len(),
-            "published lending-only pool-state snapshot"
+            liquity_rows = snapshot.liquity_rates.len(),
+            "published lending/liquity-only pool-state snapshot"
         );
         watch.send_replace(snapshot);
         return;
@@ -1170,7 +1228,8 @@ fn process_chain<N>(
         }
     }
 
-    if entries.is_empty() && rates.is_empty() && lending_data.is_empty() {
+    if entries.is_empty() && rates.is_empty() && liquity_rates.is_empty() && lending_data.is_empty()
+    {
         return;
     }
 
@@ -1181,6 +1240,7 @@ fn process_chain<N>(
         base_fee,
         entries,
         rates,
+        liquity_rates,
         lending: lending_data,
     };
 
@@ -1519,6 +1579,107 @@ where
     }
 }
 
+/// Calls the Liquity `getRates` view pinned to the new chain tip and
+/// returns the decoded rows, or empty on failure.
+///
+/// Called on every committed block when the Liquity contract is configured:
+/// the contract takes no arguments and returns its full configured table
+/// regardless of the block's events, so the snapshot stays fresh
+/// block-to-block.
+fn process_liquity_rates<E>(
+    chain: &Chain<EthPrimitives>,
+    cfg: &PoolStateConfig,
+    evm_config: &E,
+    provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
+) -> Vec<LiquityRatesEntry>
+where
+    E: ConfigureEvm<Primitives = EthPrimitives>,
+    E::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
+        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
+    >,
+{
+    let Some(contract) = cfg.contract_liquity_rates else {
+        return Vec::new();
+    };
+    let tip = chain.tip();
+
+    let (mut call_evm, chain_id, _base_fee) =
+        match build_call_evm(evm_config, provider, tip.header(), tip.hash()) {
+            Ok(built) => built,
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    block_number = tip.number(),
+                    error = %err,
+                    "failed to build call evm; skipping liquity rates"
+                );
+                return Vec::new();
+            }
+        };
+
+    let call_started = std::time::Instant::now();
+    match call_contract(
+        &mut call_evm,
+        evm_config,
+        contract,
+        ILiquityRates::getRatesCall {}.abi_encode().into(),
+        chain_id,
+    ) {
+        Ok(output) => {
+            tracing::info!(
+                target: TARGET,
+                family = "liquity",
+                call = "getRates",
+                block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                "getRates call completed"
+            );
+            match ILiquityRates::getRatesCall::abi_decode_returns(&output) {
+                Ok(outs) => outs.iter().map(liquity_entry).collect(),
+                Err(err) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode getRates output; publishing pools without liquity rates"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                family = "liquity",
+                block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "getRates call failed; publishing pools without liquity rates"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Maps one decoded Liquity `getRates` row to its snapshot entry; every
+/// uint256 becomes a decimal string (JS-safe).
+fn liquity_entry(out: &ILiquityRates::Out) -> LiquityRatesEntry {
+    LiquityRatesEntry {
+        protocol: out.protocol.to_string(),
+        col0: liquity_col(&out.col0),
+        col1: liquity_col(&out.col1),
+        col2: liquity_col(&out.col2),
+        col3: liquity_col(&out.col3),
+        col4: liquity_col(&out.col4),
+        col5: liquity_col(&out.col5),
+    }
+}
+
+/// Formats one `getRates` column as decimal strings.
+fn liquity_col(col: &[U256]) -> Vec<String> {
+    col.iter().map(U256::to_string).collect()
+}
+
 /// The shared EVM instance used for the per-chain `eth_call`s: revm `State`
 /// over the tip's historical state provider.
 type CallEvm<E> = EvmFor<E, State<StateProviderDatabase<StateProviderBox>>>;
@@ -1747,5 +1908,36 @@ mod tests {
         assert!(registry.replace_keys(Vec::new()).is_empty());
         assert!(!registry.contains_id(&id));
         assert!(registry.keys_for(&[id]).is_empty());
+    }
+
+    /// Liquity `getRates` rows round-trip through the sol binding and map
+    /// to decimal-string snapshot entries.
+    #[test]
+    fn liquity_get_rates_round_trip() {
+        let outs = vec![ILiquityRates::Out {
+            protocol: U256::from(2u8),
+            col0: vec![U256::from(10u8), U256::from(11u8)],
+            col1: vec![U256::from(20u8)],
+            col2: Vec::new(),
+            col3: vec![U256::from(40u8)],
+            col4: Vec::new(),
+            col5: vec![U256::from(60u8), U256::from(61u8)],
+        }];
+
+        let encoded = ILiquityRates::getRatesCall::abi_encode_returns(&outs);
+        let decoded = ILiquityRates::getRatesCall::abi_decode_returns(&encoded)
+            .expect("encoded returns must decode");
+        assert_eq!(decoded.len(), 1);
+
+        let entry = liquity_entry(&decoded[0]);
+        assert_eq!(entry.protocol, "2");
+        assert_eq!(entry.col0, vec!["10".to_string(), "11".to_string()]);
+        assert!(entry.col2.is_empty());
+        assert_eq!(entry.col5.len(), 2);
+
+        // Snapshot JSON keeps camelCase field names.
+        let json = serde_json::to_value(&entry).expect("entry serializes");
+        assert_eq!(json["protocol"], serde_json::json!("2"));
+        assert_eq!(json["col0"], serde_json::json!(["10", "11"]));
     }
 }

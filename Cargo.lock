@@ -7270,7 +7270,7 @@ dependencies = [
 
 [[package]]
 name = "pool-state-exex"
-version = "2.4.1"
+version = "2.11.0"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -10136,12 +10136,12 @@ dependencies = [
 
 [[package]]
 name = "reth-pool-state-exex"
-version = "2.4.1"
+version = "2.11.0"
 dependencies = [
  "alloy-consensus",
- "alloy-evm",
  "alloy-primitives",
  "alloy-sol-types",
+ "evm2",
  "eyre",
  "futures",
  "jsonrpsee",
@@ -10151,8 +10151,6 @@ dependencies = [
  "reth-node-api",
  "reth-primitives-traits",
  "reth-provider",
- "reth-revm",
- "revm",
  "serde",
  "serde_json",
  "tokio",

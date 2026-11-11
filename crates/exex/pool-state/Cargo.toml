@@ -19,11 +19,9 @@ reth-exex.workspace = true
 reth-node-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
-reth-revm.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
-alloy-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 
@@ -38,11 +36,6 @@ serde_json.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 tracing.workspace = true
 
-revm = { workspace = true, features = [
-    "optional_block_gas_limit",
-    "optional_eip3607",
-    "optional_fee_charge",
-    "optional_no_base_fee",
-] }
+evm2.workspace = true
 
 [dev-dependencies]

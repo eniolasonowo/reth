@@ -176,13 +176,8 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                     }
 
                     if let Some(block_overrides) = block_overrides {
-                        // ensure we don't allow uncapped gas limit per block
-                        // if let Some(gas_limit_override) = block_overrides.gas_limit &&
-                        //     gas_limit_override > evm_env.block_env().gas_limit.to::<u64>() &&
-                        //     gas_limit_override > this.call_gas_limit()
-                        // {
-                        //     return Err(EthApiError::other(EthSimulateError::GasLimitReached).into())
-                        // }
+                        // The gas-limit override rejection is intentionally not enforced:
+                        // simulated blocks may override the gas limit without a cap.
                         apply_block_overrides(block_overrides, &mut db, &mut evm_env);
                     }
                     if let Some(ref state_overrides) = state_overrides {

@@ -49,6 +49,8 @@ pub trait PoolStateApi {
     fn subscribe(&self);
 }
 
+/// JSON-RPC server for the `poolState` namespace.
+#[derive(Debug)]
 pub struct PoolStateRpc {
     /// Latest published snapshot.
     rx: watch::Receiver<PoolStateSnapshot>,

@@ -7,7 +7,7 @@
 //! 2. Selects one tick per pool: the last `Swap` tick outranks liquidity events; otherwise the last
 //!    `Mint`/`Burn`/`ModifyLiquidity` `tickLower`.
 //! 3. Batches all selected pools into a single `getMultiTicksRange` `eth_call` pinned to the new
-//!    chain tip, plus `getMultiRates` calls (V4 PoolKey- and V3 address-keyed), a Liquity
+//!    chain tip, plus `getMultiRates` calls (V4 `PoolKey`- and V3 address-keyed), a Liquity
 //!    `getRates` call and a lending `blockUpdate` call when configured.
 //! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a [`watch`] channel served by
 //!    the `poolState` RPC namespace (see [`rpc`]).
@@ -16,29 +16,30 @@
 //! [`EthPrimitives`], so it runs on stock Ethereum nodes as well as custom
 //! chains.
 
-use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
-use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160, U256};
+use alloy_consensus::{BlockHeader as _, SignableTransaction, TxEip1559, TxReceipt as _};
+use alloy_primitives::{Address, Bytes, Log, Signature, Signed, TxKind, B256, I256, U160, U256};
 use alloy_sol_types::{SolCall, SolEvent};
 use futures::TryStreamExt;
-use reth_ethereum_primitives::EthPrimitives;
-use reth_evm::{ConfigureEvm, Evm as _, EvmFactory, EvmFor};
+use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_evm::{
+    database::StateProviderDatabase, ConfigureEvm, Evm as _, EvmEnv, EvmFor, FromRecoveredTx,
+    TxEnvFor,
+};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_primitives_traits::{HeaderTy, Recovered};
-use reth_provider::{Chain, StateProviderBox, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::context_interface::{result::ResultAndState, Block as _};
+use reth_provider::{Chain, StateProvider, StateProviderFactory};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::watch;
 
 /// Tracing target used by this crate.
 const TARGET: &str = "exex::pool_state";
 
-/// UniswapV3 `Swap(address,address,int256,int256,uint160,uint128,int24)`.
+/// `UniswapV3` `Swap(address,address,int256,int256,uint160,uint128,int24)`.
 pub const TOPIC_UNISWAP_V3_SWAP: B256 =
     alloy_primitives::b256!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
-/// PancakeV3 `Swap(address indexed sender,address indexed recipient,int256 amount0,int256
+/// `PancakeV3` `Swap(address indexed sender,address indexed recipient,int256 amount0,int256
 /// amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint128 protocolFeesToken0,uint128
 /// protocolFeesToken1)`.
 pub const TOPIC_PANCAKE_V3_SWAP: B256 =
@@ -54,13 +55,13 @@ pub const TOPIC_V3_MINT: B256 =
 pub const TOPIC_V3_BURN: B256 =
     alloy_primitives::b256!("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
 
-/// UniswapV4 `ModifyLiquidity(bytes32 indexed id,address indexed sender,int24 tickLower,int24
+/// `UniswapV4` `ModifyLiquidity(bytes32 indexed id,address indexed sender,int24 tickLower,int24
 /// tickUpper,int256 liquidityDelta)`.
 pub const TOPIC_V4_MODIFY_LIQUIDITY: B256 =
     alloy_primitives::b256!("0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec");
 
-/// UniswapV4 `Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160
-/// sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)`.
+/// `UniswapV4` `Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128
+/// amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)`.
 pub const TOPIC_V4_SWAP: B256 =
     alloy_primitives::b256!("0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
 
@@ -106,7 +107,7 @@ pub fn default_topics() -> Vec<B256> {
     ]
 }
 
-/// V3-family event bindings (UniswapV3 / PancakeV3 share signatures).
+/// V3-family event bindings (`UniswapV3` / `PancakeV3` share signatures).
 mod v3_events {
     alloy_sol_types::sol! {
         #[derive(Debug)]
@@ -143,7 +144,7 @@ mod v3_events {
     }
 }
 
-/// PancakeV3 event bindings (signature extends UniswapV3's Swap with two
+/// `PancakeV3` event bindings (signature extends `UniswapV3`'s Swap with two
 /// trailing protocol-fee fields, hence a different topic0).
 mod pancake_events {
     alloy_sol_types::sol! {
@@ -427,11 +428,13 @@ pub struct PoolStateEntry {
     /// Pool fee in hundredths of a bip.
     pub lp_fee: u32,
 
-    /// SqrtPriceX96
+    /// `SqrtPriceX96`
     pub sqrtprice_x96: U160,
     /// liquidity
     pub liquidity: u128,
+    /// Token0 balance delta reported by the event.
     pub amount0: I256,
+    /// Token1 balance delta reported by the event.
     pub amount1: I256,
     /// Tick range around the trigger tick.
     pub range: Vec<TickRangeEntry>,
@@ -539,7 +542,7 @@ pub struct LendingBlockUpdateData {
 
 impl LendingBlockUpdateData {
     /// True when neither market details nor positions were produced.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.market_details.is_empty() && self.positions.is_empty()
     }
 }
@@ -576,7 +579,7 @@ pub struct PoolStateSnapshot {
 pub type PoolStateWatch = watch::Sender<PoolStateSnapshot>;
 
 /// Shared registry of V4 pools eligible for `getMultiRates` data, mapping
-/// pool id (keccak256-abi-encoded PoolKey) to its key. Cheap to clone;
+/// pool id (keccak256-abi-encoded `PoolKey`) to its key. Cheap to clone;
 /// clones share the same underlying map.
 #[derive(Debug, Default)]
 pub struct RatesPoolRegistry {
@@ -631,7 +634,7 @@ impl RatesPoolRegistry {
     }
 }
 
-/// Computes the V4 pool id of a PoolKey: keccak256(abi.encode(key)), the
+/// Computes the V4 pool id of a `PoolKey`: keccak256(abi.encode(key)), the
 /// same as v4-core's `PoolIdLibrary.toId`.
 pub fn pool_key_id(key: &IV4Rates::PoolKey) -> B256 {
     use alloy_sol_types::SolValue;
@@ -767,7 +770,7 @@ struct Selection {
 }
 
 impl Selection {
-    fn swap(
+    const fn swap(
         tick: i32,
         sqrt_price_x96: U160,
         liquidity: u128,
@@ -777,7 +780,7 @@ impl Selection {
         Self { tick, is_swap: true, sqrt_price_x96, liquidity, amount0, amount1 }
     }
 
-    fn liquidity_event(tick: i32) -> Self {
+    const fn liquidity_event(tick: i32) -> Self {
         Self {
             tick,
             is_swap: false,
@@ -803,9 +806,7 @@ where
         Provider: StateProviderFactory + Clone + Unpin + 'static,
         Types: NodeTypes<Primitives = EthPrimitives>,
     >,
-    <N::Evm as ConfigureEvm>::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
-    >,
+    TxEnvFor<N::Evm>: FromRecoveredTx<TransactionSigned>,
 {
     let exex_id = "pool-state";
 
@@ -833,11 +834,8 @@ where
                     &lending_markets,
                 );
             }
-            ExExNotification::ChainReorged { .. } => {
+            ExExNotification::ChainReorged { .. } | ExExNotification::ChainReverted { .. } => {
                 // Snapshot is recomputed from the next committed chain.
-            }
-            ExExNotification::ChainReverted { .. } => {
-                // State will be refreshed by the next committed chain.
             }
         }
 
@@ -852,6 +850,7 @@ where
 
 /// Scans a committed chain for matching events, batches one
 /// `getMultiTicksRange` call at the chain tip and publishes the snapshot.
+#[expect(clippy::too_many_arguments)]
 fn process_chain<N>(
     chain: &Chain<EthPrimitives>,
     cfg: &PoolStateConfig,
@@ -866,9 +865,7 @@ fn process_chain<N>(
         Provider: StateProviderFactory + Clone + Unpin + 'static,
         Types: NodeTypes<Primitives = EthPrimitives>,
     >,
-    <N::Evm as ConfigureEvm>::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
-    >,
+    TxEnvFor<N::Evm>: FromRecoveredTx<TransactionSigned>,
 {
     // Per-family pool selections; a family without a configured contract is
     // not tracked at all.
@@ -1467,9 +1464,7 @@ fn process_lending_block_update<E>(
 ) -> LendingBlockUpdateData
 where
     E: ConfigureEvm<Primitives = EthPrimitives>,
-    E::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
-    >,
+    TxEnvFor<E>: FromRecoveredTx<TransactionSigned>,
 {
     let Some(contract) = cfg.contract_lending else {
         return LendingBlockUpdateData::default();
@@ -1594,9 +1589,7 @@ fn process_liquity_rates<E>(
 ) -> Vec<LiquityRatesEntry>
 where
     E: ConfigureEvm<Primitives = EthPrimitives>,
-    E::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
-    >,
+    TxEnvFor<E>: FromRecoveredTx<TransactionSigned>,
 {
     let Some(contract) = cfg.contract_liquity_rates else {
         return Vec::new();
@@ -1682,47 +1675,50 @@ fn liquity_col(col: &[U256]) -> Vec<String> {
 
 /// The shared EVM instance used for the per-chain `eth_call`s: revm `State`
 /// over the tip's historical state provider.
-type CallEvm<E> = EvmFor<E, State<StateProviderDatabase<StateProviderBox>>>;
+type CallEvm<'a, E> = EvmFor<'a, E>;
 
 /// Builds the EVM instance shared by all of a chain's calls, pinned to the
 /// state at the given block.
 ///
 /// Mirrors reth's `eth_call` handling (see `prepare_call_env` in
 /// `rpc-eth-api/src/helpers/call.rs`): same cfg relaxations.
-fn build_call_evm<E>(
+fn build_call_evm<'a, E>(
     evm_config: &E,
     provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
     header: &HeaderTy<E::Primitives>,
     at: B256,
-) -> eyre::Result<(CallEvm<E>, u64 /* chain_id */, u64 /* base_fee */)>
+) -> eyre::Result<(CallEvm<'a, E>, u64 /* chain_id */, u64 /* base_fee */)>
 where
     E: ConfigureEvm<Primitives = EthPrimitives>,
 {
     let state = provider.history_by_block_hash(at)?;
 
     let mut evm_env = evm_config.evm_env(header)?;
-
-    let chain_id = evm_env.cfg_env.chain_id;
-    // Captured before `disable_base_fee` relaxes the env below.
-    let base_fee = evm_env.block_env.basefee();
+    let chain_id = evm_env.chain_id();
+    // Captured before the base fee check is disabled below.
+    let base_fee = evm_env.block_env().basefee.saturating_to();
 
     // Same relaxations `prepare_call_env` applies for `eth_call`.
-    evm_env.cfg_env.disable_nonce_check = true;
-    evm_env.cfg_env.disable_base_fee = true;
-    evm_env.cfg_env.disable_eip3607 = true;
-    evm_env.cfg_env.disable_block_gas_limit = true;
-    evm_env.cfg_env.disable_fee_charge = true;
-    evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    evm_env.version_mut().features.remove(evm2::EvmFeatures::NONCE_CHECK);
+    evm_env.version_mut().features.remove(evm2::EvmFeatures::BASE_FEE_CHECK);
+    evm_env.version_mut().features.remove(evm2::EvmFeatures::EIP3607);
+    evm_env.version_mut().features.remove(evm2::EvmFeatures::BLOCK_GAS_LIMIT_CHECK);
+    evm_env.version_mut().features.remove(evm2::EvmFeatures::FEE_CHARGE);
+    evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
 
-    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
-    Ok((evm_config.evm_with_env(db, evm_env), chain_id, base_fee))
+    Ok((
+        evm_config
+            .evm_with_env(StateProviderDatabase::new(state.into_evm_state_provider()), evm_env),
+        chain_id,
+        base_fee,
+    ))
 }
 
 /// Executes an arbitrary call on the shared EVM: sender `0x0`, zero gas
 /// price, unlimited gas. The call may leave (no-op) state changes in the
 /// `State` overlay, which is fine for view contracts. Returns the raw output.
 fn call_contract<E>(
-    evm: &mut CallEvm<E>,
+    evm: &mut CallEvm<'_, E>,
     evm_config: &E,
     contract: Address,
     calldata: Bytes,
@@ -1730,9 +1726,7 @@ fn call_contract<E>(
 ) -> eyre::Result<Bytes>
 where
     E: ConfigureEvm<Primitives = EthPrimitives>,
-    E::BlockExecutorFactory: alloy_evm::block::BlockExecutorFactory<
-        EvmFactory: EvmFactory<Tx: reth_evm::FromRecoveredTx<TxEip1559>>,
-    >,
+    TxEnvFor<E>: FromRecoveredTx<TransactionSigned>,
 {
     let tx = TxEip1559 {
         gas_limit: u64::MAX,
@@ -1744,10 +1738,17 @@ where
         chain_id,
         ..Default::default()
     };
-
-    let tx_env = evm_config.tx_env(Recovered::new_unchecked(tx, Address::ZERO));
-    let ResultAndState { result, .. } = evm.transact_raw(tx_env)?;
-    result.into_output().ok_or_else(|| eyre::eyre!("call returned no output"))
+    // The envelope shape requires a signature, but it is never validated: the zeroed
+    // caller with the checks disabled below makes any signature equivalent.
+    let tx_env = evm_config.tx_env(Recovered::new_unchecked(
+        TransactionSigned::Eip1559(tx.into_signed(Signature::test_signature())),
+        Address::ZERO,
+    ));
+    let result = evm.transact_result(&tx_env)?;
+    if result.output.is_empty() {
+        return Err(eyre::eyre!("call returned no output"));
+    }
+    Ok(result.output)
 }
 
 pub mod rpc;

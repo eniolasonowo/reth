@@ -8,7 +8,7 @@ use reth_ethereum::{
 };
 use reth_pool_state_exex::{
     pool_state_exex, rpc::build_pool_state_rpc_module, LendingMarketRegistry, PoolStateConfig,
-    PoolStateWatch, RatesPoolRegistry, V3RatesPoolRegistry,
+    PoolStateWatch, RatesPoolRegistry, V3RatesPoolRegistry, V3TickPoolRegistry, V4TickPoolRegistry,
 };
 
 /// Extra CLI arguments for the pool-state ExEx.
@@ -108,10 +108,14 @@ fn main() -> eyre::Result<()> {
             let (watch_tx, watch_rx) = tokio::sync::watch::channel(Default::default());
             let rates_pools = RatesPoolRegistry::new();
             let v3_rates_pools = V3RatesPoolRegistry::new();
+            let v3_tick_pools = V3TickPoolRegistry::new();
+            let v4_tick_pools = V4TickPoolRegistry::new();
             let lending_markets = LendingMarketRegistry::new();
 
             let exex_rates_pools = rates_pools.clone();
             let exex_v3_rates_pools = v3_rates_pools.clone();
+            let exex_v3_tick_pools = v3_tick_pools.clone();
+            let exex_v4_tick_pools = v4_tick_pools.clone();
             let exex_lending_markets = lending_markets.clone();
 
             let handle: NodeHandleFor<EthereumNode> = builder
@@ -125,6 +129,8 @@ fn main() -> eyre::Result<()> {
                             watch,
                             exex_rates_pools,
                             exex_v3_rates_pools,
+                            exex_v3_tick_pools,
+                            exex_v4_tick_pools,
                             exex_lending_markets,
                         ))
                     }
@@ -134,6 +140,8 @@ fn main() -> eyre::Result<()> {
                         watch_rx,
                         rates_pools,
                         v3_rates_pools,
+                        v3_tick_pools,
+                        v4_tick_pools,
                         lending_markets,
                     ))?;
                     Ok(())

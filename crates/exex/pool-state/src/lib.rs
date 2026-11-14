@@ -6,9 +6,9 @@
 //!    `ModifyLiquidity`, and Morpho-family lending events).
 //! 2. Selects one tick per pool: the last `Swap` tick outranks liquidity events; otherwise the last
 //!    `Mint`/`Burn`/`ModifyLiquidity` `tickLower`.
-//! 3. Batches all selected pools into a single `getMultiTicksRange` `eth_call` pinned to the new
-//!    chain tip, plus `getMultiRates` calls (V4 `PoolKey`- and V3 address-keyed), a Liquity
-//!    `getRates` call and a lending `blockUpdate` call when configured.
+//! 3. Batches the pools saved in the tracked tick sets into a single `getMultiTicksRange`
+//!    `eth_call` pinned to the new chain tip, plus `getMultiRates` calls (V4 `PoolKey`- and V3
+//!    address-keyed), a Liquity `getRates` call and a lending `blockUpdate` call when configured.
 //! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a [`watch`] channel served by
 //!    the `poolState` RPC namespace (see [`rpc`]).
 //!
@@ -714,6 +714,90 @@ impl LendingMarketRegistry {
     }
 }
 
+/// Shared registry of V3 pools eligible for `getMultiTicksRange` calls,
+/// keyed by pool address. Cheap to clone; clones share the same underlying
+/// set.
+#[derive(Debug, Default)]
+pub struct V3TickPoolRegistry {
+    ids: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<Address>>>,
+}
+
+impl Clone for V3TickPoolRegistry {
+    fn clone(&self) -> Self {
+        Self { ids: std::sync::Arc::clone(&self.ids) }
+    }
+}
+
+impl V3TickPoolRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the tracked pool address set with the given ids (deduped).
+    /// An empty slice disables V3 tick-range tracking.
+    pub fn replace_ids(&self, ids: Vec<Address>) {
+        let mut set = self.ids.write().expect("v3 tick pool registry poisoned");
+        set.clear();
+        set.extend(ids);
+    }
+
+    /// Returns the currently tracked pool addresses (sorted for a stable order).
+    pub fn ids(&self) -> Vec<Address> {
+        let set = self.ids.read().expect("v3 tick pool registry poisoned");
+        let mut ids: Vec<_> = set.iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Snapshot of the tracked set for per-block filtering.
+    fn tracked(&self) -> std::collections::HashSet<Address> {
+        self.ids.read().expect("v3 tick pool registry poisoned").clone()
+    }
+}
+
+/// Shared registry of V4 pools eligible for `getMultiTicksRange` calls,
+/// keyed by pool id (keccak256-abi-encoded `PoolKey`). Cheap to clone;
+/// clones share the same underlying set.
+#[derive(Debug, Default)]
+pub struct V4TickPoolRegistry {
+    ids: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<B256>>>,
+}
+
+impl Clone for V4TickPoolRegistry {
+    fn clone(&self) -> Self {
+        Self { ids: std::sync::Arc::clone(&self.ids) }
+    }
+}
+
+impl V4TickPoolRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the tracked pool id set with the given ids (deduped).
+    /// An empty slice disables V4 tick-range tracking.
+    pub fn replace_ids(&self, ids: Vec<B256>) {
+        let mut set = self.ids.write().expect("v4 tick pool registry poisoned");
+        set.clear();
+        set.extend(ids);
+    }
+
+    /// Returns the currently tracked pool ids (sorted for a stable order).
+    pub fn ids(&self) -> Vec<B256> {
+        let set = self.ids.read().expect("v4 tick pool registry poisoned");
+        let mut ids: Vec<_> = set.iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Snapshot of the tracked set for per-block filtering.
+    fn tracked(&self) -> std::collections::HashSet<B256> {
+        self.ids.read().expect("v4 tick pool registry poisoned").clone()
+    }
+}
+
 /// Pool-state ExEx configuration.
 #[derive(Debug, Clone)]
 pub struct PoolStateConfig {
@@ -792,13 +876,28 @@ impl Selection {
     }
 }
 
+/// Filters scanned selections down to the tracked tick pools; an empty
+/// tracked set disables the family's tick-range calls entirely.
+fn filter_tracked<K: Copy + Ord + std::hash::Hash + Eq>(
+    selections: BTreeMap<K, Selection>,
+    tracked: &std::collections::HashSet<K>,
+) -> BTreeMap<K, Selection> {
+    if tracked.is_empty() {
+        return BTreeMap::new();
+    }
+    selections.into_iter().filter(|(key, _)| tracked.contains(key)).collect()
+}
+
 /// Pool-state ExEx entry point.
+#[expect(clippy::too_many_arguments)]
 pub async fn pool_state_exex<N>(
     mut ctx: ExExContext<N>,
     cfg: PoolStateConfig,
     watch: PoolStateWatch,
     rates_pools: RatesPoolRegistry,
     v3_rates_pools: V3RatesPoolRegistry,
+    v3_tick_pools: V3TickPoolRegistry,
+    v4_tick_pools: V4TickPoolRegistry,
     lending_markets: LendingMarketRegistry,
 ) -> eyre::Result<()>
 where
@@ -831,6 +930,8 @@ where
                     &watch,
                     &rates_pools,
                     &v3_rates_pools,
+                    &v3_tick_pools,
+                    &v4_tick_pools,
                     &lending_markets,
                 );
             }
@@ -859,6 +960,8 @@ fn process_chain<N>(
     watch: &PoolStateWatch,
     rates_pools: &RatesPoolRegistry,
     v3_rates_pools: &V3RatesPoolRegistry,
+    v3_tick_pools: &V3TickPoolRegistry,
+    v4_tick_pools: &V4TickPoolRegistry,
     lending_markets: &LendingMarketRegistry,
 ) where
     N: FullNodeComponents<
@@ -915,6 +1018,13 @@ fn process_chain<N>(
     } else {
         Vec::new()
     };
+
+    // Only saved pools are included in the tick-range calls; an empty saved
+    // set disables the family's calls entirely.
+    let tracked_v3 = v3_tick_pools.tracked();
+    let tracked_v4 = v4_tick_pools.tracked();
+    let selections_v3 = filter_tracked(selections_v3, &tracked_v3);
+    let selections_v4 = filter_tracked(selections_v4, &tracked_v4);
 
     if selections_v3.is_empty() && selections_v4.is_empty() {
         if lending_data.is_empty() && liquity_rates.is_empty() {
@@ -1940,5 +2050,67 @@ mod tests {
         let json = serde_json::to_value(&entry).expect("entry serializes");
         assert_eq!(json["protocol"], serde_json::json!("2"));
         assert_eq!(json["col0"], serde_json::json!(["10", "11"]));
+    }
+
+    /// Tick pool registries replace (not extend) their sets, dedupe inputs
+    /// and return sorted ids; replacing with an empty list disables
+    /// tracking.
+    #[test]
+    fn tick_pool_registries_replace_dedup_and_clear() {
+        let pool_a = Address::left_padding_from(&[0x0a]);
+        let pool_b = Address::left_padding_from(&[0x0b]);
+
+        let v3 = V3TickPoolRegistry::new();
+        v3.replace_ids(vec![pool_b, pool_a, pool_b]);
+        assert_eq!(v3.ids(), vec![pool_a, pool_b]);
+        assert!(v3.tracked().contains(&pool_a));
+
+        v3.replace_ids(Vec::new());
+        assert!(v3.ids().is_empty());
+        assert!(v3.tracked().is_empty());
+
+        let id_a = B256::left_padding_from(&[0x0a]);
+        let id_b = B256::left_padding_from(&[0x0b]);
+        let v4 = V4TickPoolRegistry::new();
+        v4.replace_ids(vec![id_b, id_a, id_a]);
+        assert_eq!(v4.ids(), vec![id_a, id_b]);
+
+        v4.replace_ids(vec![id_a]);
+        assert_eq!(v4.ids(), vec![id_a]);
+    }
+
+    /// `filter_tracked` keeps only tracked selections, treats an empty
+    /// tracked set as "disable the family" and preserves scan order (the
+    /// `getMultiTicksRange` args and results are zipped positionally).
+    #[test]
+    fn filter_tracked_semantics() {
+        let tracked_a = Address::left_padding_from(&[0x0a]);
+        let untracked = Address::left_padding_from(&[0x0c]);
+
+        let selections = BTreeMap::from([
+            (tracked_a, Selection::liquidity_event(10)),
+            (untracked, Selection::liquidity_event(20)),
+        ]);
+
+        let tracked = std::collections::HashSet::from([tracked_a]);
+        let filtered = filter_tracked(selections.clone(), &tracked);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains_key(&tracked_a));
+        assert_eq!(filtered[&tracked_a].tick, 10);
+
+        // Empty tracked set disables the family's calls entirely.
+        let empty = std::collections::HashSet::new();
+        assert!(filter_tracked(selections, &empty).is_empty());
+
+        // Order survives filtering: keys stay sorted.
+        let pool_1 = Address::left_padding_from(&[0x01]);
+        let pool_2 = Address::left_padding_from(&[0x02]);
+        let both = BTreeMap::from([
+            (pool_2, Selection::liquidity_event(2)),
+            (pool_1, Selection::liquidity_event(1)),
+        ]);
+        let tracked_both = std::collections::HashSet::from([pool_1, pool_2]);
+        let keys: Vec<_> = filter_tracked(both, &tracked_both).into_keys().collect();
+        assert_eq!(keys, vec![pool_1, pool_2]);
     }
 }

@@ -6,10 +6,12 @@
 //! tip and publishes the decoded response on a [`watch`] channel; this
 //! module serves it as `poolState_latest` and `poolState_subscribe`, plus
 //! the registry mutators `poolState_addRatesPools`,
-//! `poolState_addV3RatesPools` and `poolState_addLendingMarkets`.
+//! `poolState_addV3RatesPools`, `poolState_addV3TickPools`,
+//! `poolState_addV4TickPools` and `poolState_addLendingMarkets`.
 
 use crate::{
     IV4Rates, LendingMarketRegistry, PoolStateSnapshot, RatesPoolRegistry, V3RatesPoolRegistry,
+    V3TickPoolRegistry, V4TickPoolRegistry,
 };
 use alloy_primitives::{Address, B256};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, PendingSubscriptionSink, SubscriptionMessage};
@@ -38,6 +40,19 @@ pub trait PoolStateApi {
     #[method(name = "addV3RatesPools")]
     fn add_v3_rates_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>>;
 
+    /// Replaces the tracked V3 tick pool address set. Only these pools are
+    /// included in the per-block `getMultiTicksRange` call. An empty list
+    /// disables V3 tick-range tracking. Returns the new full list.
+    #[method(name = "addV3TickPools")]
+    fn add_v3_tick_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>>;
+
+    /// Replaces the tracked V4 tick pool id set (bytes32 pool ids, the
+    /// keccak256-abi-encoded `PoolKey`). Only these pools are included in
+    /// the per-block `getMultiTicksRange` call. An empty list disables V4
+    /// tick-range tracking. Returns the new full list.
+    #[method(name = "addV4TickPools")]
+    fn add_v4_tick_pools(&self, ids: Vec<B256>) -> RpcResult<Vec<B256>>;
+
     /// Replaces the lending market id set passed as `allMarket` to
     /// `blockUpdate`. An empty list clears it. Returns the new full list.
     #[method(name = "addLendingMarkets")]
@@ -58,6 +73,10 @@ pub struct PoolStateRpc {
     rates_pools: RatesPoolRegistry,
     /// Tracked V3 rates pool addresses.
     v3_rates_pools: V3RatesPoolRegistry,
+    /// Tracked V3 tick pool addresses.
+    v3_tick_pools: V3TickPoolRegistry,
+    /// Tracked V4 tick pool ids.
+    v4_tick_pools: V4TickPoolRegistry,
     /// Lending market ids passed as `allMarket` to `blockUpdate`.
     lending_markets: LendingMarketRegistry,
 }
@@ -77,6 +96,16 @@ impl PoolStateApiServer for PoolStateRpc {
     fn add_v3_rates_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>> {
         self.v3_rates_pools.replace_ids(ids);
         Ok(self.v3_rates_pools.ids())
+    }
+
+    fn add_v3_tick_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>> {
+        self.v3_tick_pools.replace_ids(ids);
+        Ok(self.v3_tick_pools.ids())
+    }
+
+    fn add_v4_tick_pools(&self, ids: Vec<B256>) -> RpcResult<Vec<B256>> {
+        self.v4_tick_pools.replace_ids(ids);
+        Ok(self.v4_tick_pools.ids())
     }
 
     fn add_lending_markets(&self, ids: Vec<B256>) -> RpcResult<Vec<B256>> {
@@ -112,12 +141,15 @@ impl PoolStateApiServer for PoolStateRpc {
 }
 
 /// Builds the `poolState` RPC module backed by the given watch receiver,
-/// rates pool registries and lending market registry.
+/// rates pool registries, tick pool registries and lending market registry.
 pub fn build_pool_state_rpc_module(
     rx: watch::Receiver<PoolStateSnapshot>,
     rates_pools: RatesPoolRegistry,
     v3_rates_pools: V3RatesPoolRegistry,
+    v3_tick_pools: V3TickPoolRegistry,
+    v4_tick_pools: V4TickPoolRegistry,
     lending_markets: LendingMarketRegistry,
 ) -> jsonrpsee::RpcModule<PoolStateRpc> {
-    PoolStateRpc { rx, rates_pools, v3_rates_pools, lending_markets }.into_rpc()
+    PoolStateRpc { rx, rates_pools, v3_rates_pools, v3_tick_pools, v4_tick_pools, lending_markets }
+        .into_rpc()
 }

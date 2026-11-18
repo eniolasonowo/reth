@@ -82,14 +82,22 @@ fn main() -> eyre::Result<()> {
     Cli::<reth_ethereum::cli::chainspec::EthereumChainSpecParser, PoolStateArgs>::parse().run(
         async move |builder, ext| {
             let pool_state_cfg = if ext.exex_pool_state {
-                let contract_v3 = ext.exex_pool_state_v3_contract;
-                let contract_v4 = ext.exex_pool_state_v4_contract;
-                if contract_v3.is_none() && contract_v4.is_none() {
+                if ext.exex_pool_state_v3_contract.is_none() &&
+                    ext.exex_pool_state_v4_contract.is_none() &&
+                    ext.exex_pool_state_v4_rates_contract.is_none() &&
+                    ext.exex_pool_state_v3_rates_contract.is_none() &&
+                    ext.exex_pool_state_liquity_contract.is_none() &&
+                    ext.exex_pool_state_lending_contract.is_none()
+                {
                     eyre::bail!(
-                        "--exex.pool-state requires at least one of --exex.pool-state.v3-contract \
-                     or --exex.pool-state.v4-contract"
+                        "--exex.pool-state requires at least one contract flag: \
+                     --exex.pool-state.v3-contract, --exex.pool-state.v4-contract, \
+                     --exex.pool-state.v3-rates-contract, --exex.pool-state.v4-rates-contract, \
+                     --exex.pool-state.liquity-contract or --exex.pool-state.lending-contract"
                     );
                 }
+                let contract_v3 = ext.exex_pool_state_v3_contract;
+                let contract_v4 = ext.exex_pool_state_v4_contract;
                 PoolStateConfig::new(
                     contract_v3,
                     contract_v4,

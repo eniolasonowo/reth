@@ -8,8 +8,8 @@
 //!    `Mint`/`Burn`/`ModifyLiquidity` `tickLower`.
 //! 3. Batches the pools saved in the tracked tick sets into a single `getMultiTicksRange`
 //!    `eth_call` pinned to the new chain tip, plus `getMultiRates` calls (V4 `PoolKey`- and V3
-//!    address-keyed), a Liquity `getLiquityData` call and a lending
-//!    `blockUpdate` call when configured.
+//!    address-keyed) for the pools saved in the tracked rates sets, a Liquity `getLiquityData` call
+//!    and a lending `blockUpdate` call when configured.
 //! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a [`watch`] channel served by
 //!    the `poolState` RPC namespace (see [`rpc`]).
 //!
@@ -611,8 +611,8 @@ pub struct PoolStateSnapshot {
 
     /// One entry per pool that had a matching event in the block.
     pub entries: Vec<PoolStateEntry>,
-    /// One entry per pool with a configured rates contract; empty if no
-    /// rates contract is configured or the call failed.
+    /// One entry per rates-tracked pool touched by the block's events;
+    /// empty if no rates contract is configured or the call failed.
     pub rates: Vec<PoolRatesEntry>,
     /// Liquity data from `getLiquityData`; None if the Liquity contract is
     /// not configured or the call failed.
@@ -935,6 +935,16 @@ fn filter_tracked<K: Copy + Ord + std::hash::Hash + Eq>(
     selections.into_iter().filter(|(key, _)| tracked.contains(key)).collect()
 }
 
+/// Rates call candidates: keys of `selections` also tracked in the family's
+/// rates registry, in scan order. Applied to the raw selections before tick
+/// filtering, so rates tracking is independent of the tick registries.
+fn rates_candidates<K: Copy + Ord>(
+    selections: &BTreeMap<K, Selection>,
+    tracked: impl Fn(&K) -> bool,
+) -> Vec<K> {
+    selections.keys().filter(|key| tracked(key)).copied().collect()
+}
+
 /// Pool-state ExEx entry point.
 #[expect(clippy::too_many_arguments)]
 pub async fn pool_state_exex<N>(
@@ -1066,6 +1076,14 @@ fn process_chain<N>(
         None
     };
 
+    // Rates candidates come from the raw selections: pools touched by this
+    // block's events that are also tracked via the rates registries. This
+    // is independent of the tick registries, which only gate the
+    // tick-range calls below.
+    let rates_pool_ids = rates_candidates(&selections_v4, |id| rates_pools.contains_id(id));
+    let v3_rates_pool_ids =
+        rates_candidates(&selections_v3, |pool| v3_rates_pools.contains_id(pool));
+
     // Only saved pools are included in the tick-range calls; an empty saved
     // set disables the family's calls entirely.
     let tracked_v3 = v3_tick_pools.tracked();
@@ -1073,7 +1091,11 @@ fn process_chain<N>(
     let selections_v3 = filter_tracked(selections_v3, &tracked_v3);
     let selections_v4 = filter_tracked(selections_v4, &tracked_v4);
 
-    if selections_v3.is_empty() && selections_v4.is_empty() {
+    if selections_v3.is_empty() &&
+        selections_v4.is_empty() &&
+        rates_pool_ids.is_empty() &&
+        v3_rates_pool_ids.is_empty()
+    {
         if lending_data.is_empty() && liquity.is_none() {
             return;
         }
@@ -1265,13 +1287,9 @@ fn process_chain<N>(
         }
     }
 
-    // Rates call for the V4 pools; independent of the ticks call outcome.
+    // Rates calls; independent of the ticks call outcome. Candidates were
+    // selected from the raw selections above.
     let mut rates: Vec<PoolRatesEntry> = Vec::new();
-    // Only pools both touched by this block's events and tracked via
-    // `poolState_addRatesPools` get rates data; an empty registry disables
-    // the rates call entirely.
-    let rates_pool_ids: Vec<B256> =
-        selections_v4.keys().filter(|id| rates_pools.contains_id(id)).copied().collect();
     if let (Some(rates_contract), false) = (cfg.contract_v4_rates, rates_pool_ids.is_empty()) {
         let call_keys = rates_pools.keys_for(&rates_pool_ids);
 
@@ -1325,11 +1343,7 @@ fn process_chain<N>(
         }
     }
 
-    // V3 rates: only pools both touched by this block's events and tracked
-    // via `poolState_addV3RatesPools` get rates data; an empty registry
-    // disables the call entirely.
-    let v3_rates_pool_ids: Vec<Address> =
-        selections_v3.keys().filter(|pool| v3_rates_pools.contains_id(pool)).copied().collect();
+    // V3 rates: candidates were selected from the raw selections above.
     if let (Some(rates_contract), false) = (cfg.contract_v3_rates, v3_rates_pool_ids.is_empty()) {
         let call_pool_ids = v3_rates_pool_ids.clone();
         let call_started = std::time::Instant::now();
@@ -1407,8 +1421,10 @@ fn process_chain<N>(
 }
 
 /// Applies one log to the per-family selection maps. V3-family pools are
-/// keyed by address, V4-family pools by bytes32 id; families without a
-/// configured contract are skipped.
+/// keyed by address, V4-family pools by bytes32 id; families with neither a
+/// tick nor a rates contract configured are skipped. Selections drive both
+/// the tick-range calls (via the tick registries) and the rates candidates
+/// (via the rates registries), so a rates-only config still tracks events.
 fn process_log(
     log: &Log,
     cfg: &PoolStateConfig,
@@ -1421,6 +1437,12 @@ fn process_log(
     if !cfg.topics.contains(&topic0) {
         return;
     }
+
+    // A family's events are recorded when either of its contracts is
+    // configured: tick selections drive `getMultiTicksRange`, raw
+    // selections drive the `getMultiRates` candidates.
+    let tracks_v3 = cfg.contract_v3.is_some() || cfg.contract_v3_rates.is_some();
+    let tracks_v4 = cfg.contract_v4.is_some() || cfg.contract_v4_rates.is_some();
 
     let insert_swap =
         |selections: &mut BTreeMap<B256, Selection>, pool_id: B256, sel: Selection| {
@@ -1453,28 +1475,26 @@ fn process_log(
 
     let to_i32 = |v: Signed<24, 1>| i32::try_from(v).unwrap_or_default();
     match topic0 {
-        t if t == TOPIC_UNISWAP_V3_SWAP => {
-            match (cfg.contract_v3, v3_events::Swap::decode_log(log)) {
-                (Some(_), Ok(event)) => insert_v3_swap(
-                    selections_v3,
-                    log.address,
-                    Selection::swap(
-                        to_i32(event.tick),
-                        event.sqrtPriceX96,
-                        event.liquidity,
-                        event.amount0,
-                        event.amount1,
-                    ),
+        t if t == TOPIC_UNISWAP_V3_SWAP => match (tracks_v3, v3_events::Swap::decode_log(log)) {
+            (true, Ok(event)) => insert_v3_swap(
+                selections_v3,
+                log.address,
+                Selection::swap(
+                    to_i32(event.tick),
+                    event.sqrtPriceX96,
+                    event.liquidity,
+                    event.amount0,
+                    event.amount1,
                 ),
-                (Some(_), Err(err)) => {
-                    tracing::debug!(target: TARGET, error = %err, "failed to decode v3 Swap log")
-                }
-                (None, _) => {}
+            ),
+            (true, Err(err)) => {
+                tracing::debug!(target: TARGET, error = %err, "failed to decode v3 Swap log")
             }
-        }
+            (false, _) => {}
+        },
         t if t == TOPIC_PANCAKE_V3_SWAP => {
-            match (cfg.contract_v3, pancake_events::Swap::decode_log(log)) {
-                (Some(_), Ok(event)) => insert_v3_swap(
+            match (tracks_v3, pancake_events::Swap::decode_log(log)) {
+                (true, Ok(event)) => insert_v3_swap(
                     selections_v3,
                     log.address,
                     Selection::swap(
@@ -1485,32 +1505,32 @@ fn process_log(
                         event.amount1,
                     ),
                 ),
-                (Some(_), Err(err)) => {
+                (true, Err(err)) => {
                     tracing::debug!(target: TARGET, error = %err, "failed to decode pancake v3 Swap log")
                 }
-                (None, _) => {}
+                (false, _) => {}
             }
         }
-        t if t == TOPIC_V3_MINT => match (cfg.contract_v3, v3_events::Mint::decode_log(log)) {
-            (Some(_), Ok(event)) => {
+        t if t == TOPIC_V3_MINT => match (tracks_v3, v3_events::Mint::decode_log(log)) {
+            (true, Ok(event)) => {
                 insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
             }
-            (Some(_), Err(err)) => {
+            (true, Err(err)) => {
                 tracing::debug!(target: TARGET, error = %err, "failed to decode v3 Mint log")
             }
-            (None, _) => {}
+            (false, _) => {}
         },
-        t if t == TOPIC_V3_BURN => match (cfg.contract_v3, v3_events::Burn::decode_log(log)) {
-            (Some(_), Ok(event)) => {
+        t if t == TOPIC_V3_BURN => match (tracks_v3, v3_events::Burn::decode_log(log)) {
+            (true, Ok(event)) => {
                 insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
             }
-            (Some(_), Err(err)) => {
+            (true, Err(err)) => {
                 tracing::debug!(target: TARGET, error = %err, "failed to decode v3 Burn log")
             }
-            (None, _) => {}
+            (false, _) => {}
         },
-        t if t == TOPIC_V4_SWAP => match (cfg.contract_v4, v4_events::Swap::decode_log(log)) {
-            (Some(_), Ok(event)) => insert_swap(
+        t if t == TOPIC_V4_SWAP => match (tracks_v4, v4_events::Swap::decode_log(log)) {
+            (true, Ok(event)) => insert_swap(
                 selections_v4,
                 event.id,
                 Selection::swap(
@@ -1521,22 +1541,22 @@ fn process_log(
                     I256::try_from(event.amount1).unwrap_or_default(),
                 ),
             ),
-            (Some(_), Err(err)) => {
+            (true, Err(err)) => {
                 tracing::debug!(target: TARGET, error = %err, "failed to decode v4 Swap log")
             }
-            (None, _) => {}
+            (false, _) => {}
         },
         t if t == TOPIC_V4_MODIFY_LIQUIDITY => {
-            match (cfg.contract_v4, v4_events::ModifyLiquidity::decode_log(log)) {
-                (Some(_), Ok(event)) => {
+            match (tracks_v4, v4_events::ModifyLiquidity::decode_log(log)) {
+                (true, Ok(event)) => {
                     insert_liquidity(selections_v4, event.id, to_i32(event.tickLower))
                 }
-                (Some(_), Err(err)) => tracing::debug!(
+                (true, Err(err)) => tracing::debug!(
                     target: TARGET,
                     error = %err,
                     "failed to decode v4 ModifyLiquidity log"
                 ),
-                (None, _) => {}
+                (false, _) => {}
             }
         }
         _ => {}
@@ -2192,5 +2212,102 @@ mod tests {
         let tracked_both = std::collections::HashSet::from([pool_1, pool_2]);
         let keys: Vec<_> = filter_tracked(both, &tracked_both).into_keys().collect();
         assert_eq!(keys, vec![pool_1, pool_2]);
+    }
+
+    /// `rates_candidates` picks the selections also tracked in the rates
+    /// set, in scan order; applied to the raw selections, rates tracking is
+    /// independent of the tick registries.
+    #[test]
+    fn rates_candidates_semantics() {
+        let tracked_a = Address::left_padding_from(&[0x0a]);
+        let untracked = Address::left_padding_from(&[0x0c]);
+
+        let selections = BTreeMap::from([
+            (tracked_a, Selection::liquidity_event(10)),
+            (untracked, Selection::liquidity_event(20)),
+        ]);
+        let tracked = std::collections::HashSet::from([tracked_a]);
+        assert_eq!(
+            rates_candidates(&selections, |key| tracked.contains(key)),
+            vec![tracked_a],
+            "candidates must be the selections intersected with the rates set"
+        );
+
+        // Empty rates set: no candidates, the rates call is disabled.
+        assert!(rates_candidates(&selections, |_| false).is_empty());
+    }
+
+    /// A family's events are recorded when only its rates contract is
+    /// configured, so rates tracking works without a tick contract; with no
+    /// family contract configured, nothing is recorded.
+    #[test]
+    fn process_log_records_events_for_rates_only_contracts() {
+        let tick = Signed::<24, 1>::try_from(10i32).expect("tick fits");
+        let v3_log = Log {
+            address: Address::repeat_byte(0xaa),
+            data: v3_events::Swap {
+                sender: Address::ZERO,
+                recipient: Address::ZERO,
+                amount0: I256::try_from(-100i64).unwrap(),
+                amount1: I256::try_from(100i64).unwrap(),
+                sqrtPriceX96: U160::from(1u8),
+                liquidity: 1u128,
+                tick,
+            }
+            .encode_log_data(),
+        };
+
+        // Rates-only V3 config: the swap selection is recorded.
+        let mut selections_v3 = BTreeMap::new();
+        let mut selections_v4 = BTreeMap::new();
+        let cfg = PoolStateConfig::new(
+            None,
+            None,
+            None,
+            Some(Address::repeat_byte(0x01)),
+            None,
+            None,
+            None,
+        );
+        process_log(&v3_log, &cfg, &mut selections_v3, &mut selections_v4);
+        assert_eq!(selections_v3[&v3_log.address].tick, i32::try_from(tick).unwrap());
+        assert!(selections_v4.is_empty());
+
+        // No V3 contract at all: nothing is recorded.
+        let mut selections_v3 = BTreeMap::new();
+        let mut selections_v4 = BTreeMap::new();
+        let cfg = PoolStateConfig::new(None, None, None, None, None, None, None);
+        process_log(&v3_log, &cfg, &mut selections_v3, &mut selections_v4);
+        assert!(selections_v3.is_empty());
+        assert!(selections_v4.is_empty());
+
+        // Rates-only V4 config: the swap selection is recorded by pool id.
+        let pool_id = B256::repeat_byte(0xbb);
+        let v4_tick = Signed::<24, 1>::try_from(20i32).expect("tick fits");
+        let v4_log = Log {
+            address: Address::repeat_byte(0xcc),
+            data: v4_events::Swap {
+                id: pool_id,
+                sender: Address::ZERO,
+                amount0: -100i128,
+                amount1: 100i128,
+                sqrtPriceX96: U160::from(1u8),
+                liquidity: 1u128,
+                tick: v4_tick,
+                fee: alloy_primitives::Uint::<24, 1>::try_from(3000u32).expect("fee fits"),
+            }
+            .encode_log_data(),
+        };
+        let cfg = PoolStateConfig::new(
+            None,
+            None,
+            Some(Address::repeat_byte(0x02)),
+            None,
+            None,
+            None,
+            None,
+        );
+        process_log(&v4_log, &cfg, &mut selections_v3, &mut selections_v4);
+        assert_eq!(selections_v4[&pool_id].tick, i32::try_from(v4_tick).unwrap());
     }
 }

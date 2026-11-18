@@ -27,16 +27,19 @@ pub trait PoolStateApi {
     fn latest(&self) -> RpcResult<Option<PoolStateSnapshot>>;
 
     /// Replaces the tracked rates pool set with the given V4 pool keys;
-    /// only these pools will have `getMultiRates` data in subsequent
-    /// snapshots. Returns the computed pool ids (keccak256 of the encoded
-    /// key) in the same order. An empty list disables rates tracking.
+    /// pools touched by a block's V4 swap/liquidity events that are in this
+    /// set get `getMultiRates` data in subsequent snapshots, independent of
+    /// tick tracking. Returns the computed pool ids (keccak256 of the
+    /// encoded key) in the same order. An empty list disables rates
+    /// tracking.
     #[method(name = "addRatesPools")]
     fn add_rates_pools(&self, keys: Vec<IV4Rates::PoolKey>) -> RpcResult<Vec<B256>>;
 
-    /// Replaces the tracked V3 rates pool address set with the given
-    /// addresses; only these pools will have `getMultiRates` data in
-    /// subsequent snapshots. An empty list disables V3 rates tracking.
-    /// Returns the new full list.
+    /// Replaces the tracked V3 rates pool address set; pools touched by a
+    /// block's V3 swap/liquidity events that are in this set get
+    /// `getMultiRates` data in subsequent snapshots, independent of tick
+    /// tracking. An empty list disables V3 rates tracking. Returns the new
+    /// full list.
     #[method(name = "addV3RatesPools")]
     fn add_v3_rates_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>>;
 
